@@ -45,7 +45,7 @@ def get_latest_release_version(model: Model) -> str:
     return list(FIRMWARES[model].keys())[1]
 
 
-def get_master_version(model: Model) -> str:
+def get_main_version(model: Model) -> str:
     return list(FIRMWARES[model].keys())[0]
 
 
@@ -113,8 +113,8 @@ def explore_firmwares(args: Any) -> None:
 
 
 def sort_firmwares(version: str) -> Tuple[int, ...]:
-    # Having master and url versions as the first one in the list
-    if "master" in version:
+    # Having main and url versions as the first one in the list
+    if "main" in version:
         return 99, 99, 99
     elif "url" in version:
         return 88, 88, 88
@@ -123,7 +123,7 @@ def sort_firmwares(version: str) -> Tuple[int, ...]:
     if version.endswith(ARM_IDENTIFIER):
         version = version[: -len(ARM_IDENTIFIER)]
 
-    # When the version is not \d+.\d+.\d+, make it be just below master and URL versions,
+    # When the version is not \d+.\d+.\d+, make it be just below main and URL versions,
     # so that it is well visible in the dashboard (is a custom user version)
     try:
         return tuple(int(n) for n in version.split("."))
@@ -134,9 +134,13 @@ def sort_firmwares(version: str) -> Tuple[int, ...]:
 def explore_bridges() -> None:
     # Send only suitable bridges for ARM/non-ARM
     if IS_ARM:
+        BRIDGES.append(f"2.0.33{ARM_IDENTIFIER}")
+        BRIDGES.append(f"2.0.32{ARM_IDENTIFIER}")
         BRIDGES.append(f"2.0.31{ARM_IDENTIFIER}")
         BRIDGES.append(f"2.0.30{ARM_IDENTIFIER}")
     else:
+        BRIDGES.append("2.0.33")
+        BRIDGES.append("2.0.32")
         BRIDGES.append("2.0.31")
         BRIDGES.append("2.0.27")
         BRIDGES.append("2.0.26")

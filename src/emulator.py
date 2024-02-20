@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import os
 import stat
@@ -25,8 +27,8 @@ import bridge
 import helpers
 
 # TODO: consider creating a class from this module to avoid these globals
-version_running = None
-EMULATOR = None
+VERSION_RUNNING: str | None = None
+EMULATOR: CoreEmulator | LegacyEmulator | None = None
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -95,7 +97,10 @@ def is_running() -> bool:
 
 
 def get_status() -> dict[str, Any]:
-    return {"is_running": is_running(), "version": version_running}
+    if helpers.physical_trezor():
+        return {"is_running": True, "version": "PHYSICAL_TREZOR"}
+    else:
+        return {"is_running": is_running(), "version": VERSION_RUNNING}
 
 
 def get_url_identifier(url: str) -> str:
@@ -160,7 +165,7 @@ def start(
     output_to_logfile: bool = True,
     save_screenshots: bool = False,
 ) -> None:
-    global version_running
+    global VERSION_RUNNING
     global EMULATOR
 
     binaries.check_model(model)
@@ -176,7 +181,7 @@ def start(
     if EMULATOR is not None:
         log(
             f"Before starting a new emulator - {version_model()}, "
-            f"killing the already running one - {version_running}",
+            f"killing the already running one - {VERSION_RUNNING}",
             "red",
         )
         stop()
@@ -202,6 +207,7 @@ def start(
             emu_location,
             profile_dir=str(binaries.FIRMWARE_BIN_DIR),
             logfile=logfile,
+            headless=True,
         )
 
     assert EMULATOR is not None
@@ -216,15 +222,16 @@ def start(
         EMULATOR = None
         raise
 
-    log(f"Emulator spawned. PID: {EMULATOR.process.pid}. CMD: {EMULATOR.process.args}")
+    log(f"Emulator spawned. PID: {EMULATOR.process.pid}. CMD: {EMULATOR.process.args}")  # type: ignore
 
     # Verifying if the emulator is really running
     time.sleep(0.5)
+    assert EMULATOR.process is not None
     if EMULATOR.process.poll() is not None:
         EMULATOR = None
         raise RuntimeError(f"Emulator version {version} is unable to run!")
 
-    version_running = version_model()
+    VERSION_RUNNING = version_model()
 
     # Optionally saving the screenshots on any screen-change, so we can send the
     # current screen on demand
@@ -250,17 +257,18 @@ def get_new_screenshot_dir() -> Path:
 
 def stop() -> None:
     log("Stopping")
-    global version_running
+    global VERSION_RUNNING
     global EMULATOR
 
     if EMULATOR is None:
         log("WARNING: Attempting to stop emulator, but it is not running", "red")
     else:
+        assert EMULATOR.process is not None
         emu_pid = EMULATOR.process.pid
         EMULATOR.stop()
         log(f"Emulator killed. PID: {emu_pid}.")
         EMULATOR = None
-        version_running = None
+        VERSION_RUNNING = None
 
 
 def get_current_screen() -> str:
@@ -401,6 +409,9 @@ def swipe(direction: str) -> None:
 
 def read_and_confirm_mnemonic() -> None:
     with connect_to_debuglink() as debug:
+        # So that we can wait layout
+        debug.watch_layout(True)
+
         # Clicking continue button
         debug.press_yes()
         time.sleep(SLEEP)
@@ -415,14 +426,20 @@ def read_and_confirm_mnemonic() -> None:
         time.sleep(SLEEP)
 
         # Retrieving the seed words for next "quiz"
-        mnem = debug.state().mnemonic_secret.decode("utf-8")
+        secret_bytes = debug.state().mnemonic_secret
+        assert secret_bytes is not None
+        mnem = secret_bytes.decode("utf-8")
         mnemonic = mnem.split()
         time.sleep(SLEEP)
 
         # Answering 3 questions asking for a specific word
         for _ in range(3):
-            index = debug.read_reset_word_pos()
-            debug.input(mnemonic[index])
+            layout = debug.wait_layout()
+            # "Select word 3 of 20"
+            #              ^
+            word_pos = int(layout.text_content().split()[2])
+            wanted_word = mnemonic[word_pos - 1].lower()
+            debug.input(wanted_word)
             time.sleep(SLEEP)
 
         # Click Continue to finish the quiz
@@ -451,8 +468,12 @@ def read_and_confirm_shamir_mnemonic(shares: int = 1, threshold: int = 1) -> Non
     # For setting the right amount of shares/thresholds, we need location of buttons
     MINUS_BUTTON_COORDS = (60, 70)
     PLUS_BUTTON_COORDS = (180, 70)
+    OK_BUTTON_COORDS = (200, 200)
 
     with connect_to_debuglink() as debug:
+        # So that we can wait layout
+        debug.watch_layout(True)
+
         # Click Continue to begin Shamir setup process
         debug.press_yes()
         time.sleep(SLEEP)
@@ -471,7 +492,7 @@ def read_and_confirm_shamir_mnemonic(shares: int = 1, threshold: int = 1) -> Non
                 time.sleep(SLEEP)
 
         # Click Continue to confirm the number of shares
-        debug.press_yes()
+        debug.click(OK_BUTTON_COORDS)
         time.sleep(SLEEP)
 
         # Click Continue to set threshold
@@ -511,13 +532,14 @@ def read_and_confirm_shamir_mnemonic(shares: int = 1, threshold: int = 1) -> Non
         for _ in range(shares):
             # Scrolling through all the 20 words on next 5 pages
             # While doing so, saving all the words on the screen for the "quiz" later
-            mnemonic = []
-            for _ in range(5):
-                mnemonic.extend(debug.read_reset_word().split())
-                debug.swipe_up()
-                time.sleep(SLEEP)
+            mnemonic: list[str] = []
+            layout = debug.read_layout()
+            for _ in range(layout.page_count() - 1):
+                mnemonic.extend(layout.seed_words())
+                layout = debug.swipe_up(wait=True)  # type: ignore
+                assert layout is not None
+            mnemonic.extend(layout.seed_words())
 
-            mnemonic.extend(debug.read_reset_word().split())
             assert len(mnemonic) == 20
 
             # Confirming that I have written the seed down
@@ -526,8 +548,12 @@ def read_and_confirm_shamir_mnemonic(shares: int = 1, threshold: int = 1) -> Non
 
             # Answering 3 questions asking for a specific word
             for _ in range(3):
-                index = debug.read_reset_word_pos()
-                debug.input(mnemonic[index])
+                layout = debug.wait_layout()
+                # "Select word 3 of 20"
+                #              ^
+                word_pos = int(layout.text_content().split()[2])
+                wanted_word = mnemonic[word_pos - 1].lower()
+                debug.input(wanted_word)
                 time.sleep(SLEEP)
 
             # Click Continue to finish this quiz

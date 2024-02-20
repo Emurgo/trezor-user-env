@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import json
+import os
 import traceback
 from copy import deepcopy
+from typing import TYPE_CHECKING, Any, Union
 
 from trezorlib import messages
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
@@ -13,15 +17,45 @@ import emulator
 import helpers
 from bitcoin_regtest.rpc import BTCJsonRPC
 
+if TYPE_CHECKING:
+    from typing_extensions import TypedDict
+
+    class NormalResponse(TypedDict, total=False):
+        success: bool
+        response: str | dict[str, Any]
+        id: str
+        error: str
+        traceback: str
+
+    class BackgroundCheckResponse(TypedDict):
+        response: str
+        bridge_status: bool | Any
+        emulator_status: bool | Any
+        regtest_status: bool | Any
+        background_check: bool
+
+    ResponseType = Union[NormalResponse, BackgroundCheckResponse]
+
+
 IP = "0.0.0.0"
 PORT = 9001
 LOG_COLOR = "blue"
 BRIDGE_PROXY = False  # is being set in main.py (when not disabled, will be True)
 REGTEST_RPC = BTCJsonRPC(
-    url="http://0.0.0.0:18021",
+    url=os.getenv("REGTEST_RPC_URL") or "http://0.0.0.0:18021",
     user="rpc",
     passwd="rpc",
 )
+PREV_RUNNING_MODEL: str = ""
+
+
+def is_regtest_active() -> bool:
+    """Finds out whether the regtest backend is running."""
+    try:
+        REGTEST_RPC.getblockchaininfo()
+        return True
+    except Exception:
+        return False
 
 
 def log(text: str, color: str = LOG_COLOR) -> None:
@@ -38,7 +72,7 @@ class ResponseGetter:
     def __init__(self) -> None:
         pass
 
-    def get_response(self, request: str) -> dict:
+    def get_response(self, request: str) -> "ResponseType":
         """Handles the whole process of translating request into response."""
         try:
             self.request_dict = json.loads(request)
@@ -69,7 +103,7 @@ class ResponseGetter:
         except Exception as e:
             return self.generate_exception_response(e)
 
-    def run_command_and_get_its_response(self) -> dict:
+    def run_command_and_get_its_response(self) -> "ResponseType":
         """Performs wanted action and returns details of what happened."""
         if self.command == "ping":
             return {"response": "pong"}
@@ -80,10 +114,12 @@ class ResponseGetter:
         elif self.command == "background-check":
             bridge_status = bridge.get_status()
             emulator_status = emulator.get_status()
+            regtest_status = is_regtest_active()
             return {
                 "response": "Background check done",
                 "bridge_status": bridge_status,
                 "emulator_status": emulator_status,
+                "regtest_status": regtest_status,
                 "background_check": True,
             }
         elif self.command == "exit":
@@ -100,7 +136,7 @@ class ResponseGetter:
         else:
             return {"success": False, "error": f"Unknown command - {self.command}"}
 
-    def run_bridge_command(self) -> dict:
+    def run_bridge_command(self) -> "ResponseType":
         if self.command == "bridge-start":
             version = self.request_dict.get("version", binaries.BRIDGES[0])
             output_to_logfile = self.request_dict.get("output_to_logfile", True)
@@ -123,10 +159,12 @@ class ResponseGetter:
                 "error": f"Unknown bridge command - {self.command}",
             }
 
-    def run_emulator_command(self) -> dict:
-        # The versions are sorted, the first one is the current master
+    def run_emulator_command(self) -> "ResponseType":
+        global PREV_RUNNING_MODEL
+
+        # The versions are sorted, the first one is the current main
         # build and then the rest by version number.
-        # Not supplying any version will result in "2-master",
+        # Not supplying any version will result in "2-main",
         # "X-latest" will get the latest release of X.
         if self.command == "emulator-start":
             if "version" in self.request_dict:
@@ -137,15 +175,23 @@ class ResponseGetter:
                 else:
                     version = requested_version
             else:
-                version = binaries.get_master_version("2")
+                version = binaries.get_main_version("2")
+
+            # TEMPORARY: translating `-master` to `-main` because of the firmware branch change
+            # TODO: revert this after some time
+            version = version.replace("-master", "-main")
+
             # Model is not compulsory for backwards compatibility purposes
             # Is needed now, because TR and TT are sharing the same versions
             # (default to the first character in version, which works fine for
-            # "legacy" T1 and TT setup - `2.5.0`, `2-master`, `1.10.1`, etc.)
+            # "legacy" T1 and TT setup - `2.5.0`, `2-main`, `1.10.1`, etc.)
             model = self.request_dict.get("model", version[0])
             wipe = self.request_dict.get("wipe", False)
             output_to_logfile = self.request_dict.get("output_to_logfile", True)
             save_screenshots = self.request_dict.get("save_screenshots", False)
+            if model != PREV_RUNNING_MODEL:
+                wipe = True
+            PREV_RUNNING_MODEL = model
             emulator.start(
                 version=version,
                 model=model,
@@ -163,6 +209,9 @@ class ResponseGetter:
             wipe = self.request_dict.get("wipe", False)
             output_to_logfile = self.request_dict.get("output_to_logfile", True)
             save_screenshots = self.request_dict.get("save_screenshots", False)
+            if model != PREV_RUNNING_MODEL:
+                wipe = True
+            PREV_RUNNING_MODEL = model
             emulator.start_from_url(
                 url=url,
                 model=model,
@@ -255,10 +304,12 @@ class ResponseGetter:
                 "error": f"Unknown emulator command - {self.command}",
             }
 
-    def run_regtest_command(self) -> dict:
+    def run_regtest_command(self) -> "ResponseType":
         if self.command == "regtest-mine-blocks":
             block_amount = self.request_dict["block_amount"]
-            address = self.request_dict.get("address", REGTEST_RPC.getnewaddress())
+            address: str = (
+                self.request_dict.get("address") or REGTEST_RPC.getnewaddress()
+            )
             REGTEST_RPC.generatetoaddress(block_amount, address)
             return {"response": f"Mined {block_amount} blocks by address {address}"}
         elif self.command == "regtest-send-to-address":
@@ -268,26 +319,33 @@ class ResponseGetter:
             REGTEST_RPC.sendtoaddress(address, btc_amount)
             REGTEST_RPC.generatetoaddress(1, REGTEST_RPC.getnewaddress())
             return {"response": f"{btc_amount} BTC sent to {address}."}
+        elif self.command == "regtest-generateblock":
+            address = self.request_dict["address"]
+            txids = self.request_dict["txids"]
+            REGTEST_RPC.generateblock(address, txids)
+            return {"response": f"block to {address} mined."}
         else:
             return {
                 "success": False,
                 "error": f"Unknown regtest command - {self.command}",
             }
 
-    def generate_websocket_response(self, command_response: dict) -> dict:
+    def generate_websocket_response(
+        self, command_response: "ResponseType"
+    ) -> "ResponseType":
         """Modifies the response before sending to websocket.
 
         Can conditionaly send more details according to each client's needs.
         """
         websocket_response = deepcopy(command_response)
         # Relaying request ID and filling success, if not there already
-        websocket_response["id"] = self.request_id
+        websocket_response["id"] = self.request_id  # type: ignore
         if "success" not in websocket_response:
-            websocket_response["success"] = True
+            websocket_response["success"] = True  # type: ignore
 
         return websocket_response
 
-    def generate_exception_response(self, e: Exception) -> dict:
+    def generate_exception_response(self, e: Exception) -> "ResponseType":
         """Creates response for exception case."""
         traceback_string = traceback.format_exc()
         log(traceback_string, "red")
@@ -299,7 +357,7 @@ class ResponseGetter:
             "traceback": traceback_string,
         }
         log(f"ERROR response: {response}", "red")
-        return response
+        return response  # type: ignore
 
 
 # Welcome new clients with info

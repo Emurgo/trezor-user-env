@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import os
 import socket
 import time
+from typing import TYPE_CHECKING
 
 from psutil import Popen
 
@@ -10,11 +13,19 @@ import bridge_proxy
 import helpers
 from bridge_proxy import PORT as BRIDGE_PROXY_PORT
 
+if TYPE_CHECKING:
+    from typing_extensions import TypedDict
+
+    class StatusResponse(TypedDict):
+        is_running: bool
+        version: str | None
+
+
 BRIDGE_PORT = 21325
 
 # TODO: consider creating a class from this module to avoid these globals
-BRIDGE = None
-version_running = None
+BRIDGE: Popen | None = None
+VERSION_RUNNING: str | None = None
 
 LOG_COLOR = "magenta"
 
@@ -27,8 +38,14 @@ def is_running() -> bool:
     return is_port_in_use(BRIDGE_PORT)
 
 
-def get_status() -> dict:
-    return {"is_running": is_running(), "version": version_running}
+def get_status() -> "StatusResponse":
+    if helpers.physical_trezor():
+        return {
+            "is_running": is_running(),
+            "version": f"{VERSION_RUNNING} - PHYSICAL_TREZOR",
+        }
+    else:
+        return {"is_running": is_running(), "version": VERSION_RUNNING}
 
 
 def is_port_in_use(port: int) -> bool:
@@ -46,7 +63,7 @@ def check_bridge_and_proxy_status() -> None:
 def start(version: str, proxy: bool = False, output_to_logfile: bool = True) -> None:
     log("Starting")
     global BRIDGE
-    global version_running
+    global VERSION_RUNNING
 
     # When we are on ARM, include appropriate suffix for the version if not there
     if binaries.IS_ARM and not version.endswith(binaries.ARM_IDENTIFIER):
@@ -73,7 +90,13 @@ def start(version: str, proxy: bool = False, output_to_logfile: bool = True) -> 
             f"Bridge does not exist for version {version} under {bridge_location}"
         )
 
-    command = f"{bridge_location} -ed 21324:21325 -u=false"
+    # In case user wants to use a physical device, not adding any arguments
+    # to the bridge. These arguments make the bridge optimized for emulators.
+    command = (
+        bridge_location
+        if helpers.physical_trezor()
+        else f"{bridge_location} -ed 21324:21325 -u=false"
+    )
 
     # Conditionally redirecting the output to a logfile instead of terminal/stdout
     if output_to_logfile:
@@ -91,7 +114,7 @@ def start(version: str, proxy: bool = False, output_to_logfile: bool = True) -> 
         BRIDGE = None
         raise RuntimeError(f"Bridge version {version} is unable to run!")
 
-    version_running = version
+    VERSION_RUNNING = version
 
     if proxy:
         bridge_proxy.start()
@@ -103,7 +126,7 @@ def start(version: str, proxy: bool = False, output_to_logfile: bool = True) -> 
 def stop(proxy: bool = True) -> None:
     log("Stopping")
     global BRIDGE
-    global version_running
+    global VERSION_RUNNING
 
     if BRIDGE is None:
         log("WARNING: Attempting to stop a brige, but it is not running", "red")
@@ -111,7 +134,7 @@ def stop(proxy: bool = True) -> None:
         BRIDGE.kill()
         log(f"Bridge killed: {BRIDGE}")
         BRIDGE = None
-        version_running = None
+        VERSION_RUNNING = None
 
     if proxy:
         bridge_proxy.stop()
