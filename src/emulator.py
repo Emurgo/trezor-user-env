@@ -119,15 +119,20 @@ def start_from_url(
     # Creating an identifier of emulator from this URL, so we have to
     # download it only once and can reuse it any time later
     emu_name = f"{model}-url-{get_url_identifier(url)}"
+    if binaries.IS_ARM and not emu_name.endswith(binaries.ARM_IDENTIFIER):
+        emu_name = f"{emu_name}{binaries.ARM_IDENTIFIER}"
 
     # Deciding the location to save depending on being T1/TT/TR
     # (to be compatible with already existing emulators)
-    if model == "1":
-        emu_path = binaries.USER_DOWNLOADED_DIR / f"{binaries.IDENTIFIER_T1}{emu_name}"
-    elif model == "2":
-        emu_path = binaries.USER_DOWNLOADED_DIR / f"{binaries.IDENTIFIER_TT}{emu_name}"
-    elif model == "R":
-        emu_path = binaries.USER_DOWNLOADED_DIR / f"{binaries.IDENTIFIER_TR}{emu_name}"
+    model_identifier = {
+        "1": binaries.IDENTIFIER_T1,
+        "2": binaries.IDENTIFIER_TT,
+        "R": binaries.IDENTIFIER_TR,
+        "T3T1": binaries.IDENTIFIER_T3T1,
+    }.get(model)
+    if not model_identifier:
+        raise RuntimeError(f"Unknown model {model}")
+    emu_path = binaries.USER_DOWNLOADED_DIR / f"{model_identifier}{emu_name}"
 
     # Downloading only if it does not yet exist
     if not emu_path.is_file():
@@ -135,9 +140,23 @@ def start_from_url(
         try:
             urllib.request.urlretrieve(url, emu_path)
         except HTTPError as e:
-            err = f"HTTP error when downloading emulator from {url}, err: {e}"
-            log(err, "red")
-            raise RuntimeError(err)
+            if binaries.IS_ARM and not url.endswith(binaries.ARM_IDENTIFIER):
+                log(
+                    "ARM detected, trying to download the ARM version of the emulator",
+                    "yellow",
+                )
+                url = f"{url}{binaries.ARM_IDENTIFIER}"
+                log(f"Trying to download ARM from {url}")
+                try:
+                    urllib.request.urlretrieve(url, emu_path)
+                except HTTPError as e:
+                    err = f"HTTP error when downloading emulator from {url}, err: {e}"
+                    log(err, "red")
+                    raise RuntimeError(err)
+            else:
+                err = f"HTTP error when downloading emulator from {url}, err: {e}"
+                log(err, "red")
+                raise RuntimeError(err)
         # Running chmod +x on the newly downloaded emulator and
         # patching it so it can run in Nix
         # (patching fail will not cause any python error,
@@ -194,7 +213,7 @@ def start(
 
     emu_location = Path(binaries.get_firmware_location(model, version))
 
-    if model in ("2", "R"):
+    if model in ("2", "R", "T3T1"):
         EMULATOR = CoreEmulator(
             emu_location,
             profile_dir=binaries.FIRMWARE_BIN_DIR,
@@ -207,8 +226,9 @@ def start(
             emu_location,
             profile_dir=str(binaries.FIRMWARE_BIN_DIR),
             logfile=logfile,
-            headless=True,
         )
+    else:
+        raise RuntimeError(f"Unknown model {model}")
 
     assert EMULATOR is not None
 
